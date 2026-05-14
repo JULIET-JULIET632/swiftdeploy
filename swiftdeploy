@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+import time
+import socket
+import json
+import re
+
+try:
+    import yaml
+except ImportError:
+    print("[ERROR] PyYAML is required: pip install pyyaml")
+    sys.exit(1)
+
+ROOT         = os.path.dirname(os.path.abspath(__file__))
+MANIFEST     = os.path.join(ROOT, "manifest.yaml")
+NGINX_TMPL   = os.path.join(ROOT, "templates", "nginx.conf.tmpl")
+LOGFMT_TMPL  = os.path.join(ROOT, "templates", "log_format.conf.tmpl")
+COMPOSE_TMPL = os.path.join(ROOT, "templates", "docker-compose.yml.tmpl")
+NGINX_CONF   = os.path.join(ROOT, "nginx.conf")
+LOGFMT_CONF  = os.path.join(ROOT, "log_format.conf")
+COMPOSE_FILE = os.path.join(ROOT, "docker-compose.yml")
+
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+RESET  = "\033[0m"
+
+def ok(msg):    print(f"{GREEN}[PASS]{RESET} {msg}")
+def fail(msg):  print(f"{RED}[FAIL]{RESET} {msg}")
+def info(msg):  print(f"{CYAN}[INFO]{RESET} {msg}")
+def warn(msg):  print(f"{YELLOW}[WARN]{RESET} {msg}")
+def err(msg):   print(f"{RED}[ERROR]{RESET} {msg}", file=sys.stderr)
+
+def load_manifest():
+    with open(MANIFEST) as f:
+        return yaml.safe_load(f)
+
+def render_template(tmpl_path, ctx):
+    with open(tmpl_path) as f:
+        content = f.read()
+    for key, value in ctx.items():
+        content = content.replace("{{ " + key + " }}", str(value))
+    return content
+
+def build_context(manifest):
+    return {
+        "service_image":   manifest["services"]["image"],
+        "service_port":    manifest["services"]["port"],
+        "mode":            manifest["services"].get("mode", "stable"),
+        "app_version":     manifest["services"].get("version", "1.0.0"),
+        "restart_policy":  manifest["services"].get("restart", "unless-stopped"),
+        "nginx_image":     manifest["nginx"]["image"],
+        "nginx_port":      manifest["nginx"]["port"],
+        "proxy_timeout":   manifest["nginx"].get("proxy_timeout", 30),
+        "network_name":    manifest["network"]["name"],
+        "network_driver":  manifest["network"]["driver_type"],
+        "volume_name":     manifest.get("volumes", {}).get("logs", "swiftdeploy-logs"),
+        "contact":         manifest.get("contact", "admin@swiftdeploy.local"),
+    }
+
+def cmd_init():
+    info("Running swiftdeploy init ...")
+    manifest = load_manifest()
+    ctx      = build_context(manifest)
+
+    nginx_conf = render_template(NGINX_TMPL, ctx)
+    with open(NGINX_CONF, "w") as f:
+        f.write(nginx_conf)
+    ok(f"Generated {NGINX_CONF}")
+
+    log_fmt = render_template(LOGFMT_TMPL, ctx)
+    with open(LOGFMT_CONF, "w") as f:
+        f.write(log_fmt)
+    ok(f"Generated {LOGFMT_CONF}")
+
+    compose = render_template(COMPOSE_TMPL, ctx)
+    with open(COMPOSE_FILE, "w") as f:
+        f.write(compose)
+    ok(f"Generated {COMPOSE_FILE}")
+    info("init complete.")
+
+def cmd_validate():
+    info("Running swiftdeploy validate ...")
+    passed = 0
+    total  = 5
+
+    print("\n[1/5] manifest.yaml exists and is valid YAML")
+    if not os.path.isfile(MANIFEST):
+        fail("manifest.yaml not found")
+        sys.exit(1)
+    try:
+        manifest = load_manifest()
+        ok("manifest.yaml exists and is valid YAML")
+        passed += 1
+    except yaml.YAMLError as e:
+        fail(f"Invalid YAML: {e}")
+        sys.exit(1)
+
+    print("\n[2/5] All required fields are present and non-empty")
+    required = {
+        "services.image":       manifest.get("services", {}).get("image"),
+        "services.port":        manifest.get("services", {}).get("port"),
+        "nginx.image":          manifest.get("nginx", {}).get("image"),
+        "nginx.port":           manifest.get("nginx", {}).get("port"),
+        "network.name":         manifest.get("network", {}).get("name"),
+        "network.driver_type":  manifest.get("network", {}).get("driver_type"),
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        fail(f"Missing or empty fields: {', '.join(missing)}")
+    else:
+        ok("All required fields present")
+        passed += 1
+
+    print("\n[3/5] Docker image referenced in manifest exists locally")
+    image = manifest["services"]["image"]
+    result = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
+    if result.returncode == 0:
+        ok(f"Image '{image}' found locally")
+        passed += 1
+    else:
+        fail(f"Image '{image}' not found locally — run: docker build -t {image} .")
+
+    print("\n[4/5] Nginx port is not already bound on the host")
+    nginx_port = int(manifest["nginx"]["port"])
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        in_use = s.connect_ex(("127.0.0.1", nginx_port)) == 0
+    if in_use:
+        fail(f"Port {nginx_port} is already in use")
+    else:
+        ok(f"Port {nginx_port} is free")
+        passed += 1
+
+    print("\n[5/5] Generated nginx.conf is syntactically valid")
+    if not os.path.isfile(NGINX_CONF):
+        warn("nginx.conf not found — running init first")
+        cmd_init()
+    result = subprocess.run(
+        ["docker", "run", "--rm",
+         "-v", f"{NGINX_CONF}:/etc/nginx/conf.d/default.conf:ro",
+         "-v", f"{LOGFMT_CONF}:/etc/nginx/conf.d/00_log_format.conf:ro",
+         "nginx:latest", "nginx", "-t"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0 or "host not found in upstream" in result.stderr:
+        ok("nginx.conf syntax is valid")
+        passed += 1
+    else:
+        fail(f"nginx.conf syntax error:\n{result.stderr}")
+
+    print()
+    if passed == total:
+        ok(f"All {total}/{total} checks passed — ready to deploy!")
+    else:
+        fail(f"{passed}/{total} checks passed")
+        sys.exit(1)
+
+def cmd_deploy():
+    info("Running swiftdeploy deploy ...")
+    cmd_init()
+    info("Starting stack with docker compose ...")
+    result = subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--build"],
+        cwd=ROOT
+    )
+    if result.returncode != 0:
+        err("docker compose up failed")
+        sys.exit(1)
+    manifest   = load_manifest()
+    nginx_port = manifest["nginx"]["port"]
+    url        = f"http://localhost:{nginx_port}/healthz"
+    info(f"Waiting for health checks at {url} (60s timeout) ...")
+    deadline = time.time() + 60
+    import urllib.request
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                body = json.loads(resp.read())
+                if body.get("status") == "ok":
+                    ok(f"Stack is healthy! mode={body.get('mode')} uptime={body.get('uptime')}s")
+                    info(f"Service available at http://localhost:{nginx_port}")
+                    return
+        except Exception:
+            pass
+        time.sleep(3)
+    err("Health check timed out after 60s")
+    sys.exit(1)
+
+def cmd_promote(target_mode):
+    if target_mode not in ("canary", "stable"):
+        err(f"Invalid mode '{target_mode}'. Use: canary or stable")
+        sys.exit(1)
+    info(f"Promoting to {target_mode} mode ...")
+    with open(MANIFEST) as f:
+        raw = f.read()
+    updated = re.sub(
+        r"(^\s*mode:\s*)(\S+)",
+        lambda m: m.group(1) + target_mode,
+        raw,
+        flags=re.MULTILINE
+    )
+    with open(MANIFEST, "w") as f:
+        f.write(updated)
+    ok(f"Updated manifest.yaml mode → {target_mode}")
+    manifest = load_manifest()
+    ctx      = build_context(manifest)
+    compose  = render_template(COMPOSE_TMPL, ctx)
+    with open(COMPOSE_FILE, "w") as f:
+        f.write(compose)
+    ok("Regenerated docker-compose.yml")
+    result = subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--no-deps", "app"],
+        cwd=ROOT
+    )
+    if result.returncode != 0:
+        err("Failed to restart app container")
+        sys.exit(1)
+    ok("App container restarted (nginx untouched)")
+    nginx_port = manifest["nginx"]["port"]
+    url        = f"http://localhost:{nginx_port}/healthz"
+    import urllib.request
+    info(f"Confirming new mode via {url} ...")
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                body = json.loads(resp.read())
+                reported_mode = body.get("mode")
+                if reported_mode == target_mode:
+                    ok(f"Mode confirmed: {reported_mode} | uptime={body.get('uptime')}s")
+                    return
+                else:
+                    warn(f"Mode still {reported_mode}, waiting ...")
+        except Exception:
+            pass
+        time.sleep(2)
+    err(f"Mode confirmation timed out — expected {target_mode}")
+    sys.exit(1)
+
+def cmd_teardown(clean=False):
+    info("Running swiftdeploy teardown ...")
+    if not os.path.isfile(COMPOSE_FILE):
+        warn("docker-compose.yml not found — nothing to tear down")
+    else:
+        result = subprocess.run(
+            ["docker", "compose", "-f", COMPOSE_FILE, "down", "-v", "--remove-orphans"],
+            cwd=ROOT
+        )
+        if result.returncode == 0:
+            ok("Containers, networks, and volumes removed")
+        else:
+            err("docker compose down encountered errors")
+    if clean:
+        for f in [NGINX_CONF, LOGFMT_CONF, COMPOSE_FILE]:
+            if os.path.isfile(f):
+                os.remove(f)
+                ok(f"Deleted {f}")
+        info("--clean: generated configs removed")
+    info("Teardown complete.")
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: ./swiftdeploy [init|validate|deploy|promote|teardown]")
+        sys.exit(0)
+    cmd = args[0]
+    if cmd == "init":
+        cmd_init()
+    elif cmd == "validate":
+        cmd_validate()
+    elif cmd == "deploy":
+        cmd_deploy()
+    elif cmd == "promote":
+        if len(args) < 2:
+            err("Usage: ./swiftdeploy promote [canary|stable]")
+            sys.exit(1)
+        cmd_promote(args[1])
+    elif cmd == "teardown":
+        clean = "--clean" in args
+        cmd_teardown(clean)
+    else:
+        err(f"Unknown subcommand: '{cmd}'")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
