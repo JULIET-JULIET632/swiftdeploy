@@ -23,6 +23,13 @@ server {
         error_page 504 = @error504;
     }
 
+    location /metrics {
+        proxy_pass         http://app:{{ service_port }}/metrics;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        add_header         X-Deployed-By     swiftdeploy always;
+    }
+
     location @error502 {
         default_type application/json;
         add_header X-Deployed-By swiftdeploy always;
